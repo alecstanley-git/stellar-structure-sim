@@ -1,0 +1,1 @@
+pub const INIT_SHELL_COUNT: usize = 100;
