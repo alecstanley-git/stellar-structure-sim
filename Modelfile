@@ -1,3 +1,0 @@
-FROM gemma4
-PARAMETER num_ctx 16384
-
