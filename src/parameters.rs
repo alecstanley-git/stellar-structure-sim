@@ -4,4 +4,4 @@
 pub const COMP_GRID: usize = 2000;
 
 // Fractional change in (r, P, T) allowed per adaptive integration step.
-pub const STEP_TOL: f64 = 0.01;
+

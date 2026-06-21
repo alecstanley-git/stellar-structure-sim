@@ -2,396 +2,395 @@ use std::f64::consts::PI;
 
 use crate::{
     constants::{G, M_SUN, Q_H, SEC_PER_YEAR, SIGMA},
-    integrator::{get_derivatives, rk4_step},
-    parameters::{COMP_GRID, STEP_TOL},
-    physics::{calculate_density, calculate_epsilon, calculate_opacity, mean_molecular_weight},
+    parameters::{COMP_GRID},
+    physics::{calculate_density, calculate_epsilon, calculate_epsilon_grav, calculate_nabla, calculate_opacity, mean_molecular_weight},
+    opacity::OpacityTable,
 };
+use std::sync::Arc;
+
+const R_SCALE: f64 = 6.957e10;
+const P_SCALE: f64 = 1e17;
+const L_SCALE: f64 = 3.828e33;
+const T_SCALE: f64 = 1e7;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Shell {
-    // Independent variable
-    pub m: f64, // Enclosed mass
-
-    // Dependent variables
-    pub r: f64, // Radius
-    pub p: f64, // Pressure
-    pub l: f64, // Luminosity
-    pub t: f64, // Temp
-
-    // Local composition (hydrogen mass fraction at this shell)
+    pub m: f64,
+    pub r: f64,
+    pub p: f64,
+    pub l: f64,
+    pub t: f64,
     pub x: f64,
-
-    // Derived quantities
-    pub rho: f64,     // Density
-    pub kappa: f64,   // Opacity
-    pub epsilon: f64, // Energy generation rate
-    pub nabla: f64,   // Temperature gradient
-
-    // Derivatives with respect to mass
-    pub dr_dm: f64,
-    pub dp_dm: f64,
-    pub dl_dm: f64,
-    pub dt_dm: f64,
+    
+    pub p_old: f64,
+    pub t_old: f64,
 }
 
 #[derive(Debug, Clone)]
 pub struct Star {
     pub shells: Vec<Shell>,
-
-    // Initial / surface mass fractions
-    pub x: f64, // Hydrogren
-    pub y: f64, // Helium
-    pub z: f64, // Metallicity
-
-    // Per-shell hydrogen mass fraction on a fixed Lagrangian mass grid (COMP_GRID points,
-    // index i corresponds to enclosed mass i * mass / COMP_GRID). This is what changes as
-    // the star ages: the core burns first.
-    pub comp_x: Vec<f64>,
-
-    // Converged solution parameters (the four unknowns of the fitting method), reused as
-    // the warm-start guess for the next solve.
-    pub p_c: f64, // central pressure
-    pub t_c: f64, // central temperature
-    pub r_s: f64, // surface radius
-    pub l_s: f64, // surface luminosity
-
-    // Properties
-    pub age: f64,  // Age in years
-    pub mass: f64, // Mass in grams
-}
-
-impl Shell {
-    // Update derived properties for this shell using the local hydrogen fraction `x`
-    // (helium taken as 1 - x - z to conserve mass). The mass derivatives are recomputed by
-    // the integrator; this fills in rho/kappa/epsilon/nabla for inspection and burning.
-    pub fn update_derivatives(&mut self, x: f64, z: f64) {
-        let (dr, dp, dl, dt) = get_derivatives(self.m, self.r, self.p, self.l, self.t, x, z);
-        self.dr_dm = dr;
-        self.dp_dm = dp;
-        self.dl_dm = dl;
-        self.dt_dm = dt;
-
-        let y = (1.0 - x - z).max(0.0);
-        let mu = mean_molecular_weight(x, y, z);
-        self.rho = calculate_density(self.p, self.t, mu);
-        self.kappa = calculate_opacity(self.rho, self.t, x, z);
-        self.epsilon = calculate_epsilon(self.rho, self.t, x);
-        // Actual temperature gradient nabla = dlnT/dlnP, recovered from the derivatives.
-        self.nabla = if dp != 0.0 && self.t != 0.0 {
-            (dt * self.p) / (dp * self.t)
-        } else {
-            0.0
-        };
-        self.x = x;
-    }
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub age: f64,
+    pub mass: f64,
+    pub opacity_table: Arc<OpacityTable>,
+    pub aesopus_blend: f64,
 }
 
 impl Star {
-    pub fn new(mass_solar: f64, x: f64, y: f64, z: f64) -> Self {
-        // The star starts chemically homogeneous: every grid point has the surface composition.
-        let comp_x = vec![x; COMP_GRID + 1];
-        Star {
-            shells: Vec::new(),
-            x,
-            y,
-            z,
-            comp_x,
-            // Solar-like initial guesses (CGS)
-            p_c: 2.4e17,
-            t_c: 1.5e7,
-            r_s: 6.957e10,
-            l_s: 3.828e33,
-            age: 0.0,
-            mass: mass_solar * M_SUN,
-        }
-    }
-
-    // Hydrogen fraction at enclosed mass `m`, read off the fixed composition grid.
-    fn x_at_mass(&self, m: f64) -> f64 {
-        let dm0 = self.mass / (COMP_GRID as f64);
-        let idx = (m / dm0).round() as usize;
-        self.comp_x[idx.min(self.comp_x.len() - 1)]
-    }
-
-    // Initialise the central shell with the standard power-series expansion about m = 0,
-    // which removes the coordinate singularity at the centre.
-    fn build_core(&self, p_c: f64, t_c: f64, dm: f64) -> Shell {
-        let x0 = self.x_at_mass(0.0);
-        let y0 = (1.0 - x0 - self.z).max(0.0);
-        let mu = mean_molecular_weight(x0, y0, self.z);
-        let rho_c = calculate_density(p_c, t_c, mu);
-        let eps_c = calculate_epsilon(rho_c, t_c, x0);
-
-        let r_0 = ((3.0 * dm) / (4.0 * PI * rho_c)).powf(1.0 / 3.0);
-        let p_0 = p_c
-            - (3.0 * G / (8.0 * PI))
-                * ((4.0 * PI * rho_c / 3.0).powf(4.0 / 3.0))
-                * dm.powf(2.0 / 3.0);
-        let l_0 = eps_c * dm;
-
-        let mut s = Shell {
-            m: dm,
-            r: r_0,
-            p: p_0,
-            l: l_0,
-            t: t_c,
-            x: x0,
-            ..Default::default()
-        };
-        s.update_derivatives(x0, self.z);
-        s
-    }
-
-    // Build the outer (surface) shell from trial values of the surface radius and luminosity.
-    // The surface temperature follows from the black-body / Eddington photosphere,
-    //   L = 4 pi R^2 sigma T_eff^4,
-    // and the surface pressure from the optical-depth-2/3 photospheric condition,
-    //   P_s = (2/3) g / kappa,
-    // using electron-scattering opacity (a stable, well-behaved choice at the photosphere).
-    fn build_surface(&self, r_s: f64, l_s: f64) -> Shell {
-        let x = self.x_at_mass(self.mass);
-        let t_eff = (l_s / (4.0 * PI * r_s.powi(2) * SIGMA)).powf(0.25);
-        let g = G * self.mass / r_s.powi(2);
-        let kappa_es = 0.2 * (1.0 + x);
-        let p_s = (2.0 / 3.0) * g / kappa_es;
-
-        let mut s = Shell {
-            m: self.mass,
-            r: r_s,
-            p: p_s,
-            l: l_s,
-            t: t_eff,
-            x,
-            ..Default::default()
-        };
-        s.update_derivatives(x, self.z);
-        s
-    }
-
-    // Adaptively integrate the structure equations from `start` to enclosed mass `m_target`
-    // (in either direction). The step size is chosen so the fractional change in r, P and T
-    // stays below STEP_TOL, which is what lets us march stably through both the smooth deep
-    // interior and the stiff, radius-extended surface layers. Optionally records every shell.
-    fn integrate_adaptive(
-        &self,
-        start: Shell,
-        m_target: f64,
-        mut collect: Option<&mut Vec<Shell>>,
-    ) -> Shell {
-        let mut s = start;
-        if let Some(c) = collect.as_deref_mut() {
-            c.push(s);
-        }
-
-        let dir = (m_target - s.m).signum();
-        let dm_max = 0.05 * self.mass;
-
-        let mut guard = 0;
-        while (m_target - s.m) * dir > 0.0 && guard < 2_000_000 {
-            guard += 1;
-
-            let x = self.x_at_mass(s.m);
-            let (dr, dp, _dl, dt) = get_derivatives(s.m, s.r, s.p, s.l, s.t, x, self.z);
-
-            // Step from the fastest-changing of r, P, T so no variable moves by more than
-            // STEP_TOL in a step. This must be allowed to become very small in the stiff
-            // surface layers (which carry a negligible mass fraction) and grows naturally
-            // into the smooth deep interior.
-            let mut dm = dm_max;
-            if dr.abs() > 0.0 {
-                dm = dm.min(STEP_TOL * s.r.abs() / dr.abs());
-            }
-            if dp.abs() > 0.0 {
-                dm = dm.min(STEP_TOL * s.p.abs() / dp.abs());
-            }
-            if dt.abs() > 0.0 {
-                dm = dm.min(STEP_TOL * s.t.abs() / dt.abs());
-            }
-            dm = dm.min((m_target - s.m).abs());
-
-            s = rk4_step(&s, dir * dm, x, self.z);
-
-            if let Some(c) = collect.as_deref_mut() {
-                c.push(s);
-            }
-
-            // Bail out of any numerical blow-up rather than spreading NaNs into the solver.
-            if !s.p.is_finite() || !s.t.is_finite() || !s.r.is_finite() || s.p <= 0.0 || s.t <= 0.0
-            {
-                break;
-            }
-        }
-
-        s
-    }
-
-    // Integrate outward from the centre to the fitting mass.
-    fn integrate_out(&self, p_c: f64, t_c: f64, m_fit: f64, collect: Option<&mut Vec<Shell>>) -> Shell {
-        let m_core = 1.0e-8 * self.mass;
-        let core = self.build_core(p_c, t_c, m_core);
-        self.integrate_adaptive(core, m_fit, collect)
-    }
-
-    // Integrate inward from the surface to the fitting mass.
-    fn integrate_in(&self, r_s: f64, l_s: f64, m_fit: f64, collect: Option<&mut Vec<Shell>>) -> Shell {
-        let surface = self.build_surface(r_s, l_s);
-        self.integrate_adaptive(surface, m_fit, collect)
-    }
-
-    // The four fitting residuals: outward and inward integrations must agree on r, P, L and T
-    // at the fitting point. Each is normalised by a characteristic scale so the Newton system
-    // is well conditioned. A correct (p_c, t_c, r_s, l_s) drives all four to zero.
-    fn fitting_residuals(&self, u: [f64; 4], m_fit: f64) -> [f64; 4] {
-        let [p_c, t_c, r_s, l_s] = u;
-        let out = self.integrate_out(p_c, t_c, m_fit, None);
-        let inn = self.integrate_in(r_s, l_s, m_fit, None);
-        [
-            (out.r - inn.r) / r_s,
-            (out.p - inn.p) / p_c,
-            (out.l - inn.l) / l_s,
-            (out.t - inn.t) / t_c,
-        ]
-    }
-
-    // Solve the stellar structure as a two-point boundary value problem using the fitting
-    // method: integrate outward from the core and inward from the surface (each in its
-    // numerically stable direction) and require the two solutions to match at a fitting
-    // point. A 4-D Newton-Raphson iteration adjusts (p_c, t_c, r_s, l_s) until they do.
-    //
-    // This replaces the original single un-iterated outward sweep, which could neither
-    // satisfy the surface boundary conditions nor cope with the exponential error growth
-    // that makes pure outward shooting unstable.
-    pub fn solve_structure(&mut self) {
-        let m_fit = 0.5 * self.mass;
-        let mut u = [self.p_c, self.t_c, self.r_s, self.l_s];
-
-        let norm = |f: &[f64; 4]| f.iter().map(|v| v * v).sum::<f64>().sqrt();
-        let mut f = self.fitting_residuals(u, m_fit);
-
-        for _ in 0..60 {
-            if norm(&f) < 1e-6 {
-                break;
-            }
-
-            // Finite-difference Jacobian J[i][j] = d f_i / d u_j
-            let mut j = [[0.0f64; 4]; 4];
-            for k in 0..4 {
-                let h = u[k].abs() * 1e-4;
-                let mut up = u;
-                up[k] += h;
-                let fp = self.fitting_residuals(up, m_fit);
-                for i in 0..4 {
-                    j[i][k] = (fp[i] - f[i]) / h;
-                }
-            }
-
-            // Solve J * delta = -f
-            let neg_f = [-f[0], -f[1], -f[2], -f[3]];
-            let delta = match solve4(j, neg_f) {
-                Some(d) => d,
-                None => break, // Singular Jacobian
+    pub fn new(mass_solar: f64, x: f64, y: f64, z: f64, opacity_table: Arc<OpacityTable>) -> Self {
+        let n = COMP_GRID;
+        let mass = mass_solar * M_SUN;
+        let mut shells = Vec::with_capacity(n);
+        
+        let min_m = 1.0e-8 * mass;
+        for i in 0..n {
+            let f = (i as f64) / ((n - 1) as f64);
+            let m_frac = if f < 0.5 {
+                0.5 * (2.0 * f).powf(2.5)
+            } else {
+                1.0 - 0.5 * (2.0 * (1.0 - f)).powf(6.0)
             };
+            let m = min_m + m_frac * (mass - min_m);
+            
+            // Initial guess
+            let frac = m / mass;
+            let r = 6.957e10 * frac.powf(1.0 / 3.0);
+            let p = 2.4e17 * (1.0 - frac.powf(2.0 / 3.0)).max(1e-10) + 1e4;
+            let t = 1.5e7 * (1.0 - frac.powf(2.0 / 3.0)).max(1e-10) + 5770.0;
+            let l = 3.828e33 * frac;
+            
+            shells.push(Shell {
+                m, r, p, l, t, x,
+                p_old: p, t_old: t,
+            });
+        }
+        
+        Star {
+            shells,
+            x, y, z,
+            age: 0.0,
+            mass,
+            opacity_table,
+            aesopus_blend: 0.0,
+        }
+    }
 
-            // Damped line search: shrink the step until the residual actually decreases and
-            // the parameters stay physical (positive).
-            let mut lambda = 1.0;
-            let mut improved = false;
-            for _ in 0..40 {
-                let mut u_new = u;
-                for i in 0..4 {
-                    u_new[i] += lambda * delta[i];
+    fn calculate_residuals(&self, dt: f64) -> Vec<f64> {
+        let n = self.shells.len();
+        let mut f = vec![0.0; 4 * n];
+        for i in 0..n {
+            self.calc_eqs(dt, &mut f, i);
+        }
+        f
+    }
+
+    fn calc_eqs(&self, dt: f64, f: &mut [f64], i: usize) {
+        let n = self.shells.len();
+        
+        // Inner boundary (eq 0, 1)
+        if i == 0 {
+            let s0 = &self.shells[0];
+            let mu0 = mean_molecular_weight(s0.x, (1.0 - s0.x - self.z).max(0.0), self.z);
+            let rho0 = calculate_density(s0.p, s0.t, mu0).max(1e-10);
+            let eps_nuc0 = calculate_epsilon(rho0, s0.t, s0.x, self.z);
+            let eps_grav0 = calculate_epsilon_grav(s0.t, s0.t_old, s0.p, s0.p_old, mu0, dt);
+            
+            f[0] = (s0.r - ((3.0 * s0.m) / (4.0 * PI * rho0)).powf(1.0 / 3.0)) / R_SCALE;
+            f[1] = (s0.l - (eps_nuc0 + eps_grav0) * s0.m) / L_SCALE;
+        }
+        
+        // Structure equations (eq 4*j+2 .. 4*j+5)
+        // We evaluate for j = i-1 and j = i
+        for j in i.saturating_sub(1)..=i {
+            if j >= n - 1 { continue; }
+            let s1 = &self.shells[j];
+            let s2 = &self.shells[j + 1];
+            
+            let dm = s2.m - s1.m;
+            let r_bar = 0.5 * (s1.r + s2.r).max(1e-10);
+            let p_bar = 0.5 * (s1.p + s2.p).max(1e-10);
+            let l_bar = 0.5 * (s1.l + s2.l);
+            let t_bar = 0.5 * (s1.t + s2.t).max(1e-10);
+            let x_bar = 0.5 * (s1.x + s2.x);
+            let t_old_bar = 0.5 * (s1.t_old + s2.t_old).max(1e-10);
+            let p_old_bar = 0.5 * (s1.p_old + s2.p_old).max(1e-10);
+            let m_bar = 0.5 * (s1.m + s2.m);
+            
+            let mu = mean_molecular_weight(x_bar, (1.0 - x_bar - self.z).max(0.0), self.z);
+            let rho = calculate_density(p_bar, t_bar, mu).max(1e-10);
+            let kappa = calculate_opacity(rho, t_bar, x_bar, self.z, &self.opacity_table, self.aesopus_blend);
+            let eps_nuc = calculate_epsilon(rho, t_bar, x_bar, self.z);
+            let eps_grav = calculate_epsilon_grav(t_bar, t_old_bar, p_bar, p_old_bar, mu, dt);
+            
+            // Exact integral for r^3 = r^3 + 3dm / (4 pi rho)
+            let f_r = 3.0 / (4.0 * PI * rho * (s1.r.powi(2) + s1.r * s2.r + s2.r.powi(2)).max(1e-20));
+            // Analytic integration for P using m^{2/3} for inner shells
+            let f_p = if j < 5 {
+                -(3.0 * G / (8.0 * PI)) * (4.0 * PI * rho / 3.0).powf(4.0 / 3.0) * (s2.m.powf(2.0/3.0) - s1.m.powf(2.0/3.0)) / dm
+            } else {
+                -(G * m_bar) / (4.0 * PI * r_bar.powi(4))
+            };
+            let f_l = eps_nuc + eps_grav;
+            
+            // Mixing Length Theory parameter
+            let alpha_mlt = 1.5;
+            let nabla = calculate_nabla(t_bar, p_bar, m_bar, r_bar, l_bar, rho, kappa, mu, alpha_mlt);
+            let f_t = -(G * m_bar * t_bar * nabla) / (4.0 * PI * r_bar.powi(4) * p_bar);
+            
+            let eq_idx = 4 * j + 2;
+            f[eq_idx] = (s2.r - s1.r - dm * f_r) / R_SCALE;
+            f[eq_idx + 1] = (s2.p - s1.p - dm * f_p) / P_SCALE;
+            f[eq_idx + 2] = (s2.l - s1.l - dm * f_l) / L_SCALE;
+            f[eq_idx + 3] = (s2.t - s1.t - dm * f_t) / T_SCALE;
+        }
+        
+        // Outer boundary
+        if i == n - 1 {
+            let s_n = &self.shells[n - 1];
+            let mu_n = mean_molecular_weight(s_n.x, (1.0 - s_n.x - self.z).max(0.0), self.z);
+            let rho_n = calculate_density(s_n.p, s_n.t, mu_n).max(1e-10);
+            let kappa_n = calculate_opacity(rho_n, s_n.t, s_n.x, self.z, &self.opacity_table, self.aesopus_blend);
+            
+            f[4 * n - 2] = (s_n.l - 4.0 * PI * s_n.r.powi(2) * SIGMA * s_n.t.powi(4)) / L_SCALE;
+            f[4 * n - 1] = (s_n.p - (2.0 / 3.0) * (G * self.mass) / (s_n.r.powi(2) * kappa_n)) / P_SCALE;
+        }
+    }
+
+    pub fn solve_structure(&mut self, dt: f64) {
+        let n = self.shells.len();
+        let norm = |f: &[f64]| (f.iter().map(|v| v * v).sum::<f64>() / (f.len() as f64)).sqrt();
+        
+        for iter in 0..100 {
+            let f = self.calculate_residuals(dt);
+            let current_norm = norm(&f);
+            if current_norm < 1e-4 {
+                break;
+            }
+            if iter == 99 {
+                println!("Warning: Henyey failed to converge. Norm: {:.4e}", current_norm);
+            }
+            
+            // Construct block tridiagonal Jacobian
+            let mut a_blocks = vec![[[0.0; 4]; 4]; n];
+            let mut b_blocks = vec![[[0.0; 4]; 4]; n];
+            let mut c_blocks = vec![[[0.0; 4]; 4]; n];
+            let mut d_vecs = vec![[0.0; 4]; n];
+            
+            for i in 0..n {
+                for eq in 0..4 {
+                    d_vecs[i][eq] = -f[4 * i + eq];
                 }
-                if u_new.iter().all(|v| *v > 0.0) {
-                    let f_new = self.fitting_residuals(u_new, m_fit);
-                    if norm(&f_new) < norm(&f) {
-                        u = u_new;
-                        f = f_new;
-                        improved = true;
-                        break;
+            }
+            
+            // Perturb each variable to compute Jacobian
+            for i in 0..n {
+                let vars = [self.shells[i].r, self.shells[i].p, self.shells[i].l, self.shells[i].t];
+                let scales = [R_SCALE, P_SCALE, L_SCALE, T_SCALE];
+                
+                for var_idx in 0..4 {
+                    let h = (vars[var_idx].abs() * 1e-6).max(scales[var_idx] * 1e-8);
+                    
+                    // Modify var
+                    let orig = vars[var_idx];
+                    match var_idx {
+                        0 => self.shells[i].r += h,
+                        1 => self.shells[i].p += h,
+                        2 => self.shells[i].l += h,
+                        3 => self.shells[i].t += h,
+                        _ => {}
+                    }
+                    
+                    let mut f_new = f.clone();
+                    self.calc_eqs(dt, &mut f_new, i);
+                    
+                    // Restore var
+                    match var_idx {
+                        0 => self.shells[i].r = orig,
+                        1 => self.shells[i].p = orig,
+                        2 => self.shells[i].l = orig,
+                        3 => self.shells[i].t = orig,
+                        _ => {}
+                    }
+                    
+                    // Fill B_i (derivative of eq i wrt y_i)
+                    for eq in 0..4 {
+                        b_blocks[i][eq][var_idx] = (f_new[4 * i + eq] - f[4 * i + eq]) / h;
+                    }
+                    
+                    // Fill A_i (derivative of eq i wrt y_{i-1}) -> i.e., modifying y_i affects eq {i+1} as A_{i+1}
+                    if i < n - 1 {
+                        for eq in 0..4 {
+                            a_blocks[i + 1][eq][var_idx] = (f_new[4 * (i + 1) + eq] - f[4 * (i + 1) + eq]) / h;
+                        }
+                    }
+                    
+                    // Fill C_i (derivative of eq i wrt y_{i+1}) -> i.e., modifying y_i affects eq {i-1} as C_{i-1}
+                    if i > 0 {
+                        for eq in 0..4 {
+                            c_blocks[i - 1][eq][var_idx] = (f_new[4 * (i - 1) + eq] - f[4 * (i - 1) + eq]) / h;
+                        }
                     }
                 }
-                lambda *= 0.5;
             }
-
-            if !improved {
+            
+            // Solve block tridiagonal system
+            if let Some(delta) = solve_block_tridiagonal(&a_blocks, &b_blocks, &c_blocks, &d_vecs) {
+                // Apply update with damping
+                let max_frac = delta.iter().enumerate().map(|(i, d)| {
+                    let s = &self.shells[i];
+                    (d[0].abs() / s.r.max(R_SCALE * 1e-4))
+                    .max(d[1].abs() / s.p.max(P_SCALE * 1e-4))
+                    .max(d[2].abs() / (s.l.abs() + L_SCALE * 1e-4))
+                    .max(d[3].abs() / s.t.max(T_SCALE * 1e-4))
+                }).fold(0.0f64, |a, b| a.max(b));
+                
+                let lambda = if max_frac > 0.3 { 0.3 / max_frac } else { 1.0 };
+                
+                for i in 0..n {
+                    self.shells[i].r += lambda * delta[i][0];
+                    self.shells[i].p += lambda * delta[i][1];
+                    self.shells[i].l += lambda * delta[i][2];
+                    self.shells[i].t += lambda * delta[i][3];
+                    
+                    // Enforce physical constraints
+                    self.shells[i].r = self.shells[i].r.max(1e-10);
+                    self.shells[i].p = self.shells[i].p.max(1e-10);
+                    self.shells[i].t = self.shells[i].t.max(1e-10);
+                }
+            } else {
+                println!("Warning: Singular Jacobian in Henyey solver!");
                 break;
             }
         }
-
-        self.p_c = u[0];
-        self.t_c = u[1];
-        self.r_s = u[2];
-        self.l_s = u[3];
-
-        // Rebuild the full structure profile (centre -> fit, then surface -> fit reversed).
-        let mut out_shells = Vec::new();
-        self.integrate_out(u[0], u[1], m_fit, Some(&mut out_shells));
-        let mut in_shells = Vec::new();
-        self.integrate_in(u[2], u[3], m_fit, Some(&mut in_shells));
-        in_shells.reverse();
-        out_shells.extend(in_shells);
-        self.shells = out_shells;
     }
 
-    // Energy generation rate at enclosed mass `m`, interpolated from the solved profile.
-    fn epsilon_at_mass(&self, m: f64) -> f64 {
-        if self.shells.is_empty() {
-            return 0.0;
-        }
-        // shells are ordered by increasing mass
-        match self
-            .shells
-            .binary_search_by(|s| s.m.partial_cmp(&m).unwrap())
-        {
-            Ok(i) => self.shells[i].epsilon,
-            Err(i) => {
-                if i == 0 {
-                    self.shells[0].epsilon
-                } else if i >= self.shells.len() {
-                    self.shells[self.shells.len() - 1].epsilon
-                } else {
-                    let a = &self.shells[i - 1];
-                    let b = &self.shells[i];
-                    let frac = (m - a.m) / (b.m - a.m).max(1.0);
-                    a.epsilon + frac * (b.epsilon - a.epsilon)
-                }
-            }
-        }
-    }
-
-    // Advance the chemical composition by one timestep and re-solve the structure.
-    // Hydrogen is consumed where energy is generated: dX/dt = -epsilon / Q_H. As the core
-    // hydrogen is depleted the mean molecular weight rises, the core contracts and heats and
-    // the luminosity climbs -- the star evolves along the main sequence. This replaces the
-    // original `evolve_timestep`, which only incremented the age.
     pub fn evolve_timestep(&mut self, dt_years: f64) {
         let dt_sec = dt_years * SEC_PER_YEAR;
-        let dm0 = self.mass / (COMP_GRID as f64);
-
-        for i in 0..self.comp_x.len() {
-            let m = (i as f64) * dm0;
-            let eps = self.epsilon_at_mass(m);
-            let dx = eps * dt_sec / Q_H;
-            self.comp_x[i] = (self.comp_x[i] - dx).max(0.0);
+        
+        // Burn hydrogen explicitly
+        for i in 0..self.shells.len() {
+            let (p, t, x) = {
+                let s = &self.shells[i];
+                (s.p, s.t, s.x)
+            };
+            
+            let mu = mean_molecular_weight(x, (1.0 - x - self.z).max(0.0), self.z);
+            let rho = calculate_density(p, t, mu).max(1e-10);
+            let eps_nuc = calculate_epsilon(rho, t, x, self.z);
+            
+            let dx = eps_nuc * dt_sec / Q_H;
+            
+            let s = &mut self.shells[i];
+            s.x = (x - dx).max(0.0);
+            s.p_old = p;
+            s.t_old = t;
         }
-
+        
         self.age += dt_years;
-        self.solve_structure();
+        self.solve_structure(dt_sec);
     }
 
     pub fn luminosity(&self) -> f64 {
-        self.l_s
+        self.shells.last().unwrap().l
     }
 
     pub fn radius(&self) -> f64 {
-        self.r_s
+        self.shells.last().unwrap().r
     }
 }
 
-// Solve a 4x4 linear system A x = b by Gaussian elimination with partial pivoting.
+// Block tridiagonal solver
+fn solve_block_tridiagonal(
+    a: &[[[f64; 4]; 4]],
+    b: &[[[f64; 4]; 4]],
+    c: &[[[f64; 4]; 4]],
+    d: &[[f64; 4]],
+) -> Option<Vec<[f64; 4]>> {
+    let n = b.len();
+    let mut c_prime = vec![[[0.0; 4]; 4]; n];
+    let mut d_prime = vec![[0.0; 4]; n];
+
+    let inv_b0 = invert_4x4(b[0])?;
+    c_prime[0] = mat_mul_4x4(inv_b0, c[0]);
+    d_prime[0] = mat_vec_mul_4x4(inv_b0, d[0]);
+
+    for i in 1..n {
+        let mut temp = b[i];
+        let ac = mat_mul_4x4(a[i], c_prime[i - 1]);
+        for r in 0..4 {
+            for col in 0..4 {
+                temp[r][col] -= ac[r][col];
+            }
+        }
+        
+        let inv_temp = invert_4x4(temp)?;
+        if i < n - 1 {
+            c_prime[i] = mat_mul_4x4(inv_temp, c[i]);
+        }
+        
+        let mut vec_temp = d[i];
+        let ad = mat_vec_mul_4x4(a[i], d_prime[i - 1]);
+        for r in 0..4 {
+            vec_temp[r] -= ad[r];
+        }
+        d_prime[i] = mat_vec_mul_4x4(inv_temp, vec_temp);
+    }
+
+    let mut x = vec![[0.0; 4]; n];
+    x[n - 1] = d_prime[n - 1];
+
+    for i in (0..n - 1).rev() {
+        let cx = mat_vec_mul_4x4(c_prime[i], x[i + 1]);
+        for r in 0..4 {
+            x[i][r] = d_prime[i][r] - cx[r];
+        }
+    }
+
+    Some(x)
+}
+
+fn invert_4x4(m: [[f64; 4]; 4]) -> Option<[[f64; 4]; 4]> {
+    let mut inv = [[0.0; 4]; 4];
+    for col in 0..4 {
+        let mut b = [0.0; 4];
+        b[col] = 1.0;
+        if let Some(x) = solve4(m, b) {
+            for row in 0..4 {
+                inv[row][col] = x[row];
+            }
+        } else {
+            return None;
+        }
+    }
+    Some(inv)
+}
+
+fn mat_mul_4x4(m1: [[f64; 4]; 4], m2: [[f64; 4]; 4]) -> [[f64; 4]; 4] {
+    let mut res = [[0.0; 4]; 4];
+    for i in 0..4 {
+        for j in 0..4 {
+            for k in 0..4 {
+                res[i][j] += m1[i][k] * m2[k][j];
+            }
+        }
+    }
+    res
+}
+
+fn mat_vec_mul_4x4(m: [[f64; 4]; 4], v: [f64; 4]) -> [f64; 4] {
+    let mut res = [0.0; 4];
+    for i in 0..4 {
+        for j in 0..4 {
+            res[i] += m[i][j] * v[j];
+        }
+    }
+    res
+}
+
 fn solve4(mut a: [[f64; 4]; 4], mut b: [f64; 4]) -> Option<[f64; 4]> {
     for col in 0..4 {
-        // Partial pivot
         let mut piv = col;
         for row in (col + 1)..4 {
             if a[row][col].abs() > a[piv][col].abs() {
@@ -404,17 +403,16 @@ fn solve4(mut a: [[f64; 4]; 4], mut b: [f64; 4]) -> Option<[f64; 4]> {
         a.swap(col, piv);
         b.swap(col, piv);
 
-        // Eliminate below
         for row in (col + 1)..4 {
             let factor = a[row][col] / a[col][col];
-            for c in col..4 {
-                a[row][c] -= factor * a[col][c];
+            let (left, right) = a.split_at_mut(row);
+            for (target_val, &pivot_val) in right[0].iter_mut().zip(left[col].iter()).skip(col) {
+                *target_val -= factor * pivot_val;
             }
             b[row] -= factor * b[col];
         }
     }
 
-    // Back substitution
     let mut x = [0.0f64; 4];
     for row in (0..4).rev() {
         let mut sum = b[row];

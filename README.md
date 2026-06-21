@@ -64,3 +64,35 @@ and re-solves the structure each step.
 * No gravitational/contraction energy term in dL/dm (fine on the main sequence, needed for the
   pre-main sequence and later phases).
 * Energy generation is PP only (no CNO), so this is appropriate for ≲1.2 M_sun stars.
+
+## Astrophysical Equations and Assumptions
+
+### 1. Mass Conservation
+* $\frac{\partial r}{\partial m} = \frac{1}{4 \pi r^2 \rho}$
+* **Assumption:** The star is perfectly spherically symmetric and in hydrostatic equilibrium. Rotational and magnetic effects are neglected.
+
+### 2. Hydrostatic Equilibrium
+* $\frac{\partial P}{\partial m} = -\frac{G m}{4 \pi r^4}$
+* **Assumption:** The star is in perfect hydrostatic balance. Dynamical timescales (like pulsations) are assumed to be negligible compared to the evolutionary timescale.
+
+### 3. Energy Generation
+* $\frac{\partial L}{\partial m} = \epsilon_{nuc} + \epsilon_{grav}$
+* $\epsilon_{nuc} = \epsilon_{pp} = 2.38 \times 10^6 \rho X^2 T_6^{-2/3} e^{-33.8 T_6^{-1/3}}$ (ergs/g/s)
+* $\epsilon_{grav} = -T \frac{\partial S}{\partial t} \approx c_P T \left( \frac{\nabla_{ad}}{P} \frac{dP}{dt} - \frac{1}{T} \frac{dT}{dt} \right)$
+* **Assumption:** Energy generation is dominated by the proton-proton (p-p) chain since the star is sun-like. The CNO cycle is neglected. Gravitational contraction/expansion energy is approximated over discrete timesteps using ideal gas specific heats.
+
+### 4. Temperature Gradient (Energy Transport)
+* $\frac{\partial T}{\partial m} = -\frac{G m T}{4 \pi r^4 P} \nabla$
+* $\nabla = \min(\nabla_{rad}, \nabla_{ad})$
+* $\nabla_{rad} = \frac{3 \kappa L P}{16 \pi a c G m T^4}$, $\nabla_{ad} \approx 0.4$
+* **Assumption:** Convection is modeled using a simplified Schwarzschild criterion where the actual gradient immediately becomes adiabatic if $\nabla_{rad} > \nabla_{ad}$. Mixing length theory (MLT) is not fully implemented.
+
+### 5. Equation of State (Ideal Gas + Radiation)
+* $P = P_{gas} + P_{rad} = \frac{\rho k_B T}{\mu m_H} + \frac{1}{3} a T^4$
+* **Assumption:** The stellar material is an ideal gas. Degeneracy pressure and non-ideal plasma interactions (e.g., Coulomb interactions) are neglected, which is mostly valid for a sun-like main sequence star but fails at late stages.
+
+### 6. Opacity
+* $\kappa \approx \kappa_{es} + \kappa_{ff}$
+* $\kappa_{es} = 0.2(1+X)$
+* $\kappa_{ff} = 3.8 \times 10^{22} (1+X)(1-Z) \rho T^{-3.5}$
+* **Assumption:** Opacity is a simple sum of electron scattering and a Kramers' law approximation for free-free/bound-free transitions. We do not use comprehensive OPAL opacity tables.
