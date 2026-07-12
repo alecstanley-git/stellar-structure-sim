@@ -4,9 +4,7 @@ use crate::{
     constants::{G, M_SUN, Q_H, SEC_PER_YEAR, SIGMA},
     parameters::{COMP_GRID},
     physics::{calculate_density, calculate_epsilon, calculate_epsilon_grav, calculate_nabla, calculate_opacity, mean_molecular_weight},
-    opacity::OpacityTable,
 };
-use std::sync::Arc;
 
 const R_SCALE: f64 = 6.957e10;
 const P_SCALE: f64 = 1e17;
@@ -34,12 +32,10 @@ pub struct Star {
     pub z: f64,
     pub age: f64,
     pub mass: f64,
-    pub opacity_table: Arc<OpacityTable>,
-    pub aesopus_blend: f64,
 }
 
 impl Star {
-    pub fn new(mass_solar: f64, x: f64, y: f64, z: f64, opacity_table: Arc<OpacityTable>) -> Self {
+    pub fn new(mass_solar: f64, x: f64, y: f64, z: f64) -> Self {
         let n = COMP_GRID;
         let mass = mass_solar * M_SUN;
         let mut shells = Vec::with_capacity(n);
@@ -72,8 +68,6 @@ impl Star {
             x, y, z,
             age: 0.0,
             mass,
-            opacity_table,
-            aesopus_blend: 0.0,
         }
     }
 
@@ -120,7 +114,7 @@ impl Star {
             
             let mu = mean_molecular_weight(x_bar, (1.0 - x_bar - self.z).max(0.0), self.z);
             let rho = calculate_density(p_bar, t_bar, mu).max(1e-10);
-            let kappa = calculate_opacity(rho, t_bar, x_bar, self.z, &self.opacity_table, self.aesopus_blend);
+            let kappa = calculate_opacity(rho, t_bar, x_bar, self.z);
             let eps_nuc = calculate_epsilon(rho, t_bar, x_bar, self.z);
             let eps_grav = calculate_epsilon_grav(t_bar, t_old_bar, p_bar, p_old_bar, mu, dt);
             
@@ -151,7 +145,7 @@ impl Star {
             let s_n = &self.shells[n - 1];
             let mu_n = mean_molecular_weight(s_n.x, (1.0 - s_n.x - self.z).max(0.0), self.z);
             let rho_n = calculate_density(s_n.p, s_n.t, mu_n).max(1e-10);
-            let kappa_n = calculate_opacity(rho_n, s_n.t, s_n.x, self.z, &self.opacity_table, self.aesopus_blend);
+            let kappa_n = calculate_opacity(rho_n, s_n.t, s_n.x, self.z);
             
             f[4 * n - 2] = (s_n.l - 4.0 * PI * s_n.r.powi(2) * SIGMA * s_n.t.powi(4)) / L_SCALE;
             f[4 * n - 1] = (s_n.p - (2.0 / 3.0) * (G * self.mass) / (s_n.r.powi(2) * kappa_n)) / P_SCALE;
@@ -162,15 +156,17 @@ impl Star {
         let n = self.shells.len();
         let norm = |f: &[f64]| (f.iter().map(|v| v * v).sum::<f64>() / (f.len() as f64)).sqrt();
         
+        let mut last_norm = std::f64::MAX;
         for iter in 0..100 {
             let f = self.calculate_residuals(dt);
             let current_norm = norm(&f);
             if current_norm < 1e-4 {
                 break;
             }
-            if iter == 99 {
-                println!("Warning: Henyey failed to converge. Norm: {:.4e}", current_norm);
+            if iter > 10 && (last_norm - current_norm).abs() / current_norm < 1e-4 {
+                break;
             }
+            last_norm = current_norm;
             
             // Construct block tridiagonal Jacobian
             let mut a_blocks = vec![[[0.0; 4]; 4]; n];

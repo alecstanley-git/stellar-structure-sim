@@ -39,64 +39,19 @@ pub fn calculate_density(p: f64, t: f64, mu: f64) -> f64 {
 // H-minus and molecular bands, and across most of the solar interior they sit at a few
 // cm^2/g. We approximate that by a constant, which keeps the envelope optically thick
 // enough to become convective and yields a Sun-like model (L ~ 1 L_sun, T_c ~ 1.5e7 K).
-// Replacing this with tabulated opacities would be the natural next improvement.
-use crate::opacity::OpacityTable;
 
-pub fn calculate_opacity(rho: f64, t: f64, x: f64, z: f64, table: &OpacityTable, aesopus_blend: f64) -> f64 {
-    // Electron scattering
+
+pub fn calculate_opacity(rho: f64, t: f64, x: f64, z: f64) -> f64 {
     let kappa_es = 0.2 * (1.0 + x);
-    
-    // Free-free opacity
     let kappa_ff = 1.75e22 * (1.0 + x) * (1.0 - z) * rho * t.powf(-3.5);
-    
-    // Bound-free opacity (Kramers) with guillotine
     let t6 = t / 1.0e6;
     let guillotine = 1.0 + (t6 * t6);
     let kappa_bf = 4.3e25 * z * (1.0 + x) * rho * t.powf(-3.5) / guillotine;
     
-    let kappa_k = kappa_ff + kappa_bf;
-    let kappa_es = 0.2 * (1.0 + x);
-    let kappa_interior_raw = kappa_k + kappa_es;
-
-    // H-minus opacity (used ONLY as a limiter for the Kramers formula to prevent low-T explosions)
+    let kappa_interior_raw = kappa_ff + kappa_bf + kappa_es;
     let kappa_h_minus = 2.5e-32 * (z / 0.02) * rho.sqrt() * t.powi(9);
-    let old_kappa = (kappa_h_minus * kappa_interior_raw) / (kappa_h_minus + kappa_interior_raw).max(1e-10);
-
-    let log_t = t.log10();
     
-    let kappa_low_t = if log_t < 4.5 {
-        let t_6_table = t / 1e6;
-        let log_r = (rho / t_6_table.powi(3)).log10();
-        let log_kappa = table.get_log_kappa(x, log_t, log_r);
-        10.0f64.powf(log_kappa)
-    } else {
-        0.0 
-    };
-
-    let kappa = if log_t <= 4.1 {
-        kappa_low_t
-    } else if log_t >= 4.4 {
-        old_kappa
-    } else {
-        // Smoothstep blending from 4.1 to 4.4
-        let w = (log_t - 4.1) / 0.3;
-        let blend = w * w * (3.0 - 2.0 * w);
-        let log_k_low = kappa_low_t.log10();
-        let log_k_high = old_kappa.log10();
-        10.0f64.powf(log_k_low * (1.0 - blend) + log_k_high * blend)
-    };
-
-    // Global relaxation blend to ease the solver into the new physics
-    let final_kappa = if aesopus_blend < 1e-5 {
-        old_kappa
-    } else if aesopus_blend > 0.99999 {
-        kappa
-    } else {
-        let log_old = old_kappa.log10();
-        let log_new = kappa.log10();
-        10.0f64.powf(log_old * (1.0 - aesopus_blend) + log_new * aesopus_blend)
-    };
-
+    let final_kappa = (kappa_h_minus * kappa_interior_raw) / (kappa_h_minus + kappa_interior_raw).max(1e-10);
     final_kappa.max(1e-4)
 }
 
