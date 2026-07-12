@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Stellar Structure Simulator</title>
     <meta name="description" content="A real-time stellar structure and evolution simulator interface.">
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
@@ -246,6 +247,10 @@
                     <label for="z">Metallicity (Z)</label>
                     <input type="number" id="z" value="0.02" step="0.001" min="0" max="0.1">
                 </div>
+                <div class="input-group">
+                    <label for="max_age">Max Age (Gyr)</label>
+                    <input type="number" id="max_age" value="10.0" step="0.5" min="0.1" max="15.0">
+                </div>
                 <button id="runBtn" onclick="runSimulation()">Run Simulation</button>
                 <div id="loading" style="text-align: center; margin-top: 1rem; display: none;">
                     <div class="loader"></div>
@@ -285,7 +290,7 @@
 
             <div class="charts-grid">
                 <div class="panel">
-                    <h2>Core Temperature vs Time</h2>
+                    <h2>Surface Temp vs Time</h2>
                     <div class="chart-container">
                         <canvas id="tcChart"></canvas>
                     </div>
@@ -296,16 +301,33 @@
                         <canvas id="xChart"></canvas>
                     </div>
                 </div>
+                <div class="panel">
+                    <h2>Core Temp vs Time</h2>
+                    <div class="chart-container">
+                        <canvas id="coreTChart"></canvas>
+                    </div>
+                </div>
+                <div class="panel">
+                    <h2>Stellar Radius vs Time</h2>
+                    <div class="chart-container">
+                        <canvas id="radiusChart"></canvas>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0"></script>
     <script>
         Chart.defaults.color = '#94a3b8';
         Chart.defaults.font.family = "'Outfit', sans-serif";
         Chart.defaults.scale.grid.color = 'rgba(60, 75, 105, 0.2)';
+        
+        if (typeof ChartDataLabels !== 'undefined') {
+            Chart.register(ChartDataLabels);
+        }
 
-        let hrChart, tcChart, xChart;
+        let hrChart, tcChart, xChart, coreTChart, radiusChart;
 
         function initCharts() {
             const hrCtx = document.getElementById('hrChart').getContext('2d');
@@ -326,10 +348,36 @@
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
-                    plugins: { legend: { display: false } },
+                    plugins: { 
+                        legend: { display: false },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    return `Teff: ${context.parsed.x.toFixed(0)} K, L: ${context.parsed.y.toFixed(3)} L☉`;
+                                },
+                                afterLabel: function(context) {
+                                    return `Age: ${context.raw.age} Gyr`;
+                                }
+                            }
+                        },
+                        datalabels: {
+                            display: function(context) {
+                                const index = context.dataIndex;
+                                const count = context.dataset.data.length;
+                                return count > 0 && (index === 0 || index === count - 1 || index % Math.ceil(count / 5) === 0);
+                            },
+                            formatter: function(value) {
+                                return value.age + ' Gyr';
+                            },
+                            color: '#cbd5e1',
+                            align: 'right',
+                            offset: 8,
+                            font: { size: 11, weight: '600' }
+                        }
+                    },
                     scales: {
-                        x: { type: 'linear', position: 'bottom', title: { display: true, text: 'Core Temperature (K) [Proxy for Teff]' } },
-                        y: { title: { display: true, text: 'Luminosity (L☉)' } }
+                        x: { type: 'linear', position: 'bottom', reverse: true, title: { display: true, text: 'Effective Temperature (K)' } },
+                        y: { type: 'logarithmic', title: { display: true, text: 'Luminosity (L☉)' } }
                     }
                 }
             });
@@ -337,15 +385,29 @@
             const tcCtx = document.getElementById('tcChart').getContext('2d');
             tcChart = new Chart(tcCtx, {
                 type: 'line',
-                data: { labels: [], datasets: [{ label: 'Core Temp', data: [], borderColor: '#f87171', tension: 0.4 }] },
-                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { title: { display: true, text: 'T_c (K)' } }, x: { title: { display: true, text: 'Age (Gyr)' } } } }
+                data: { labels: [], datasets: [{ label: 'Surface Temp', data: [], borderColor: '#f87171', tension: 0.4 }] },
+                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false }, datalabels: { display: false } }, scales: { y: { title: { display: true, text: 'T_eff (K)' } }, x: { title: { display: true, text: 'Age (Gyr)' } } } }
             });
 
             const xCtx = document.getElementById('xChart').getContext('2d');
             xChart = new Chart(xCtx, {
                 type: 'line',
                 data: { labels: [], datasets: [{ label: 'Core H', data: [], borderColor: '#60a5fa', tension: 0.4 }] },
-                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { min: 0, title: { display: true, text: 'X_core' } }, x: { title: { display: true, text: 'Age (Gyr)' } } } }
+                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false }, datalabels: { display: false } }, scales: { y: { min: 0, title: { display: true, text: 'X_core' } }, x: { title: { display: true, text: 'Age (Gyr)' } } } }
+            });
+            
+            const coreTCtx = document.getElementById('coreTChart').getContext('2d');
+            coreTChart = new Chart(coreTCtx, {
+                type: 'line',
+                data: { labels: [], datasets: [{ label: 'Core Temp', data: [], borderColor: '#fbbf24', tension: 0.4 }] },
+                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false }, datalabels: { display: false } }, scales: { y: { title: { display: true, text: 'T_c (K)' } }, x: { title: { display: true, text: 'Age (Gyr)' } } } }
+            });
+
+            const radiusCtx = document.getElementById('radiusChart').getContext('2d');
+            radiusChart = new Chart(radiusCtx, {
+                type: 'line',
+                data: { labels: [], datasets: [{ label: 'Radius', data: [], borderColor: '#c084fc', tension: 0.4 }] },
+                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false }, datalabels: { display: false } }, scales: { y: { title: { display: true, text: 'Radius (R☉)' } }, x: { title: { display: true, text: 'Age (Gyr)' } } } }
             });
         }
 
@@ -359,9 +421,10 @@
             const mass = document.getElementById('mass').value;
             const x = document.getElementById('x').value;
             const z = document.getElementById('z').value;
+            const max_age = document.getElementById('max_age').value;
 
             try {
-                const response = await fetch(`/simulate?mass=${mass}&x=${x}&z=${z}`);
+                const response = await fetch(`/simulate?mass=${mass}&x=${x}&z=${z}&max_age=${max_age}`);
                 const res = await response.json();
                 
                 if (res.status === 'success') {
@@ -381,18 +444,25 @@
             // Update charts
             const ages = data.map(d => d.age_gyr.toFixed(2));
             
-            // HR Diagram (Using Tc proxy for Teff since Teff is not directly in StateRecord right now)
-            // But usually HR is log Teff vs log L. We just plot Tc vs L for now as a proxy structure tracker
-            hrChart.data.datasets[0].data = data.map(d => ({ x: d.tc_k, y: d.l_lsun }));
+            // HR Diagram
+            hrChart.data.datasets[0].data = data.map(d => ({ x: d.teff_k, y: d.l_lsun, age: d.age_gyr.toFixed(2) }));
             hrChart.update();
 
             tcChart.data.labels = ages;
-            tcChart.data.datasets[0].data = data.map(d => d.tc_k);
+            tcChart.data.datasets[0].data = data.map(d => d.teff_k);
             tcChart.update();
 
             xChart.data.labels = ages;
             xChart.data.datasets[0].data = data.map(d => d.x_core);
             xChart.update();
+            
+            coreTChart.data.labels = ages;
+            coreTChart.data.datasets[0].data = data.map(d => d.t_c);
+            coreTChart.update();
+            
+            radiusChart.data.labels = ages;
+            radiusChart.data.datasets[0].data = data.map(d => d.r_rsun);
+            radiusChart.update();
 
             // Update stats
             const last = data[data.length - 1];

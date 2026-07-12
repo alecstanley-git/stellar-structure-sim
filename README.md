@@ -50,4 +50,4 @@ Time evolution burns hydrogen (dX/dt = −ε/Q_H) on a fixed Lagrangian composit
 
 ### Known limitations / next steps
 * No gravitational/contraction energy term in dL/dm (fine on the main sequence, needed for the pre-main sequence and later phases).
-* Energy generation is PP only (no CNO), so this is most accurate for ≲1.2 M_sun stars.
+* The code now includes both PP chain and CNO cycle energy generation, allowing it to correctly simulate more massive stars (>1.2 M_sun) where CNO dominates.

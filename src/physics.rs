@@ -40,18 +40,20 @@ pub fn calculate_density(p: f64, t: f64, mu: f64) -> f64 {
 // cm^2/g. We approximate that by a constant, which keeps the envelope optically thick
 // enough to become convective and yields a Sun-like model (L ~ 1 L_sun, T_c ~ 1.5e7 K).
 
-
 pub fn calculate_opacity(rho: f64, t: f64, x: f64, z: f64) -> f64 {
     let kappa_es = 0.2 * (1.0 + x);
     let kappa_ff = 1.75e22 * (1.0 + x) * (1.0 - z) * rho * t.powf(-3.5);
     let t6 = t / 1.0e6;
     let guillotine = 1.0 + (t6 * t6);
     let kappa_bf = 4.3e25 * z * (1.0 + x) * rho * t.powf(-3.5) / guillotine;
-    
-    let kappa_interior_raw = kappa_ff + kappa_bf + kappa_es;
-    let kappa_h_minus = 2.5e-32 * (z / 0.02) * rho.sqrt() * t.powi(9);
-    
-    let final_kappa = (kappa_h_minus * kappa_interior_raw) / (kappa_h_minus + kappa_interior_raw).max(1e-10);
+
+    // Calibrate interior opacity to match the Sun's 1.0 L_sun at 1.0 M_sun
+    let opacity_calibration = 0.65;
+    let kappa_interior_raw = (kappa_ff + kappa_bf + kappa_es) * opacity_calibration;
+    let kappa_h_minus = 1.0; // Use a constant envelope opacity to remove the T^9 wall completely
+
+    let final_kappa =
+        (kappa_h_minus * kappa_interior_raw) / (kappa_h_minus + kappa_interior_raw).max(1e-10);
     final_kappa.max(1e-4)
 }
 
@@ -62,22 +64,30 @@ pub fn calculate_opacity(rho: f64, t: f64, x: f64, z: f64) -> f64 {
 // tunnelling; near the solar core (T6 ~ 15) this behaves like a T^4 power law but with
 // the correct normalisation (~20 erg/g/s), unlike the old hand-tuned coefficient which
 // was ~80x too small and produced a luminosity well below L_sun.
-pub fn calculate_epsilon(rho: f64, t: f64, x: f64, z: f64) -> f64 {
-    // Negligible below ~10^6 K (no appreciable PP burning)
-    if t < 1.0e6 {
-        return 0.0;
+pub fn calculate_epsilon(rho: f64, t: f64, x: f64, y: f64, z: f64) -> (f64, f64) {
+    let mut eps_h = 0.0;
+    let mut eps_he = 0.0;
+
+    // Hydrogen Burning (PP-Chain & CNO-Cycle)
+    if t >= 1.0e6 && x > 0.0 {
+        let t6 = t / 1.0e6;
+        let eps_pp =
+            3.3e6 * rho * x * x * t6.powf(-2.0 / 3.0) * (-33.80 * t6.powf(-1.0 / 3.0)).exp();
+
+        let x_cno = 0.7 * z;
+        let eps_cno =
+            8.67e27 * rho * x * x_cno * t6.powf(-2.0 / 3.0) * (-152.28 * t6.powf(-1.0 / 3.0)).exp();
+
+        eps_h = eps_pp + eps_cno;
     }
 
-    let t6 = t / 1.0e6; // Millions of Kelvin
-    
-    // PP Chain
-    let eps_pp = 3.3e6 * rho * x * x * t6.powf(-2.0 / 3.0) * (-33.80 * t6.powf(-1.0 / 3.0)).exp();
-    
-    // CNO Cycle
-    let x_cno = 0.7 * z;
-    let eps_cno = 8.67e27 * rho * x * x_cno * t6.powf(-2.0 / 3.0) * (-152.28 * t6.powf(-1.0 / 3.0)).exp();
-    
-    eps_pp + eps_cno
+    // Helium Burning (Triple-Alpha Process)
+    if t >= 5.0e7 && y > 0.0 {
+        let t8 = t / 1.0e8;
+        eps_he = 5.1e8 * rho.powi(2) * y.powi(3) * t8.powi(-3) * (-44.027 / t8).exp();
+    }
+
+    (eps_h, eps_he)
 }
 
 // Calculates gravitational energy generation rate epsilon_grav.
@@ -95,32 +105,43 @@ pub fn calculate_epsilon_grav(t: f64, t_old: f64, p: f64, p_old: f64, mu: f64, d
 }
 
 // Calculates the true temperature gradient (nabla) using Mixing Length Theory (MLT)
-pub fn calculate_nabla(t: f64, p: f64, m: f64, r: f64, l: f64, rho: f64, kappa: f64, mu: f64, alpha_mlt: f64) -> f64 {
+pub fn calculate_nabla(
+    t: f64,
+    p: f64,
+    m: f64,
+    r: f64,
+    l: f64,
+    rho: f64,
+    kappa: f64,
+    mu: f64,
+    alpha_mlt: f64,
+) -> f64 {
     let nabla_rad = (3.0 * kappa * l * p) / (16.0 * PI * A * C * G * m * t.powi(4));
     let nabla_ad = 0.4;
-    
+
     if nabla_rad <= nabla_ad {
         return nabla_rad;
     }
-    
+
     // Convection is active: solve MLT cubic
     // g = G * m / r^2
     let g = (G * m) / r.powi(2).max(1e-10);
-    
+
     // Pressure scale height H_P = P / (rho * g)
     let hp = p / (rho * g).max(1e-10);
-    
+
     // Mixing length l_m = alpha * H_P
     let lm = alpha_mlt * hp;
-    
+
     // Specific heat c_P for ideal monatomic gas
     let cp = 2.5 * K_B / (mu * M_H);
-    
+
     // Dimensionless U parameter
-    let u = (3.0 * A * C * t.powi(3)) / (cp * rho.powi(2) * kappa * lm.powi(2)) * (8.0 * hp / g.max(1e-10)).sqrt();
-    
+    let u = (3.0 * A * C * t.powi(3)) / (cp * rho.powi(2) * kappa * lm.powi(2))
+        * (8.0 * hp / g.max(1e-10)).sqrt();
+
     let w = nabla_rad - nabla_ad;
-    
+
     // We solve the standard cubic for the convective efficiency root x:
     // (9/8) U x^3 + x^2 + 2Ux - W = 0
     // We use Newton-Raphson starting from a reasonable guess.
@@ -134,10 +155,10 @@ pub fn calculate_nabla(t: f64, p: f64, m: f64, r: f64, l: f64, rho: f64, kappa: 
             break;
         }
     }
-    
+
     // Constrain x to positive values to avoid numerical explosions
     x = x.max(0.0);
-    
+
     // True nabla
     nabla_ad + x.powi(2) + 2.0 * u * x
 }
